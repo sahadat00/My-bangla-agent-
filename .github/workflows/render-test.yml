@@ -1,0 +1,27 @@
+name: render-test
+on:
+  workflow_dispatch:
+jobs:
+  render:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - run: sudo apt-get update && sudo apt-get install -y ffmpeg
+      - name: Install
+        working-directory: video
+        run: npm install
+      - name: Render
+        working-directory: video
+        run: npx remotion render src/index.tsx Test out.mp4
+      - name: Send to Telegram
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          ALLOWED_CHAT_ID: ${{ secrets.ALLOWED_CHAT_ID }}
+        run: |
+          ls -la out.mp4 || true
+          ls -la video/out.mp4
+          curl -s -F chat_id="$ALLOWED_CHAT_ID" -F video=@video/out.mp4 -F caption="Remotion পরীক্ষা" "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendVideo"
