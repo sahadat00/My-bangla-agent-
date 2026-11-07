@@ -1,6 +1,9 @@
 import os
 import re
+import wave
+import base64
 import asyncio
+import subprocess
 import requests
 
 TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
@@ -11,10 +14,15 @@ MODELS = [
     "gemini-2.5-flash",
     "gemini-3-flash-preview",
 ]
+TTS_MODELS = [
+    "gemini-3.1-flash-tts-preview",
+    "gemini-2.5-flash-preview-tts",
+]
 VOICES_F = ["bn-BD-NabanitaNeural", "bn-IN-TanishaaNeural"]
 VOICES_M = ["bn-BD-PradeepNeural", "bn-IN-BashkarNeural"]
 TG = f"https://api.telegram.org/bot{TOKEN}"
 VOICE_CMD = re.compile(r"^ভয়েস(-ছেলে)?\s*[:ঃ]?\s*", re.S)
+GEM_CMD = re.compile(r"^জেমিনি(?:-([A-Za-z]+))?\s*[:ঃ]\s*", re.S)
 
 
 def tg_send(chat_id, text):
@@ -51,6 +59,66 @@ def tts_gtts(text, path):
     from gtts import gTTS
 
     gTTS(text=text, lang="bn").save(path)
+
+
+def tts_gemini(text, voice, wav_path):
+    prompt = (
+        "Read the following Bengali text aloud like a calm, natural documentary "
+        "narrator. Speak only the text after the colon.\n\n" + text
+    )
+    errors = []
+    for model in TTS_MODELS:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+        r = requests.post(
+            url,
+            headers={"x-goog-api-key": GEMINI_KEY},
+            json={
+                "contents": [{"parts": [{"text": prompt}]}],
+                "generationConfig": {
+                    "responseModalities": ["AUDIO"],
+                    "speechConfig": {
+                        "voiceConfig": {"prebuiltVoiceConfig": {"voiceName": voice}}
+                    },
+                },
+            },
+            timeout=180,
+        )
+        if r.status_code != 200:
+            errors.append(f"{model} -> {r.status_code}: {short_error(r)}")
+            continue
+        try:
+            b64 = r.json()["candidates"][0]["content"]["parts"][0]["inlineData"]["data"]
+        except Exception:
+            errors.append(f"{model} -> অডিও আসেনি")
+            continue
+        pcm = base64.b64decode(b64)
+        with wave.open(wav_path, "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(24000)
+            w.writeframes(pcm)
+        return model
+    raise RuntimeError("\n".join(errors))
+
+
+def handle_gemini(chat_id, text):
+    m = GEM_CMD.match(text)
+    voice = m.group(1) or "Sulafat"
+    body = text[m.end():].strip()
+    if not body:
+        tg_send(chat_id, "লিখুন: জেমিনি: আপনার স্ক্রিপ্ট")
+        return
+    tg_send(chat_id, f"Gemini ভয়েস বানাচ্ছি ({voice})...")
+    try:
+        model = tts_gemini(body, voice, "gem.wav")
+        subprocess.run(
+            ["ffmpeg", "-y", "-i", "gem.wav", "-b:a", "128k", "gem.mp3"],
+            check=True,
+            capture_output=True,
+        )
+        tg_send_audio(chat_id, "gem.mp3", f"Gemini {voice} ({model})")
+    except Exception as e:
+        tg_send(chat_id, f"ত্রুটি:\n{str(e)[:600]}")
 
 
 def handle_voice(chat_id, text):
@@ -136,7 +204,10 @@ def main():
         if chat_id != ALLOWED:
             continue
         if text.startswith("/start"):
-            tg_send(chat_id, "আমি রেডি। 'ভয়েস: স্ক্রিপ্ট' লিখে ভয়েস পান, অথবা একটা টপিক পাঠান।")
+            tg_send(chat_id, "আমি রেডি। 'ভয়েস: ...' বা 'জেমিনি: ...' লিখে ভয়েস পান, অথবা একটা টপিক পাঠান।")
+            continue
+        if GEM_CMD.match(text):
+            handle_gemini(chat_id, text)
             continue
         if VOICE_CMD.match(text):
             handle_voice(chat_id, text)
