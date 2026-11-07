@@ -27,9 +27,12 @@ VOICE_CMD = re.compile(r"^ভয়েস(-ছেলে)?\s*[:ঃ]?\s*", re.S)
 GEM_CMD = re.compile(r"^জেমিনি(?:-([A-Za-z]+))?\s*[:ঃ]\s*", re.S)
 TIME_CMD = re.compile(r"^সময়(?:-([A-Za-z]+))?\s*[:ঃ]\s*", re.S)
 PLAN_CMD = re.compile(r"^পরিকল্পনা(-লম্বা)?\s*[:ঃ]\s*", re.S)
+VIDEO_CMD = re.compile(r"^ভিডিও(-লম্বা)?\s*[:ঃ]\s*", re.S)
 BN_DIGITS = str.maketrans("0123456789", "০১২৩৪৫৬৭৮৯")
 SAMPLE_RATE = 24000
 GAP_SECONDS = 0.4
+TAIL_SECONDS = 0.8
+FPS = 30
 
 PLAN_SYSTEM = """তুমি "টপিকস বাংলা" মহাকাশ পেজের ভিডিও পরিচালক। ইউজার একটি বাংলা স্ক্রিপ্ট দেবে। তুমি শুধু দৃশ্য-পরিকল্পনা JSON আকারে দেবে। কোড লিখবে না, কোনো প্রশ্ন করবে না।
 
@@ -87,6 +90,16 @@ def tg_send_audio(chat_id, path, caption=""):
             timeout=180,
         )
     r.raise_for_status()
+
+
+def tg_send_doc(chat_id, path, caption=""):
+    with open(path, "rb") as f:
+        requests.post(
+            f"{TG}/sendDocument",
+            data={"chat_id": chat_id, "caption": caption[:200]},
+            files={"document": f},
+            timeout=60,
+        )
 
 
 def tts_edge(text, voice, path):
@@ -176,6 +189,41 @@ def to_bn(s):
     return str(s).translate(BN_DIGITS)
 
 
+def build_voice(sentences, voice, out_mp3):
+    """প্রতিটা বাক্যের ভয়েস বানিয়ে জোড়া দেয়। (সময়ের তালিকা, মোট সময়, মডেল) ফেরত দেয়।"""
+    gap = b"\x00\x00" * int(SAMPLE_RATE * GAP_SECONDS)
+    pcm_all = b""
+    t = 0.0
+    timings = []
+    models_used = set()
+    for i, s in enumerate(sentences, 1):
+        wav = f"s{i}.wav"
+        model = tts_gemini_retry(s, voice, wav)
+        models_used.add(model)
+        with wave.open(wav, "rb") as w:
+            n = w.getnframes()
+            frames = w.readframes(n)
+            dur = n / w.getframerate()
+        timings.append({"start": round(t, 2), "end": round(t + dur, 2)})
+        pcm_all += frames
+        t += dur
+        if i < len(sentences):
+            pcm_all += gap
+            t += GAP_SECONDS
+        time.sleep(3)
+    with wave.open("all.wav", "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(SAMPLE_RATE)
+        w.writeframes(pcm_all)
+    subprocess.run(
+        ["ffmpeg", "-y", "-i", "all.wav", "-b:a", "128k", out_mp3],
+        check=True,
+        capture_output=True,
+    )
+    return timings, t, sorted(models_used)
+
+
 def ask_plan(numbered_script):
     errors = []
     for model in MODELS:
@@ -240,6 +288,19 @@ def check_plan(plan, n_sent):
     return probs
 
 
+def plan_lines(plan):
+    out = []
+    for i, sc in enumerate(plan["scenes"], 1):
+        line = f"{i}. [{sc.get('template')}] বাক্য {sc.get('sentences')} | {sc.get('on_screen_text')}"
+        if sc.get("image_query"):
+            line += f" | ছবি: {sc['image_query']}"
+        line += f" | {sc.get('sfx')}"
+        if "duration_sec" in sc:
+            line += f" | {sc['start_sec']}→{sc['end_sec']} ({sc['duration_sec']}s)"
+        out.append(line)
+    return out
+
+
 def handle_plan(chat_id, text):
     m = PLAN_CMD.match(text)
     wide = bool(m.group(1))
@@ -258,12 +319,7 @@ def handle_plan(chat_id, text):
         with open("plan.json", "w", encoding="utf-8") as f:
             json.dump(plan, f, ensure_ascii=False, indent=2)
         out = [f"শিরোনাম: {plan.get('title', '')}", f"মাপ: {plan['ratio']}", ""]
-        for i, sc in enumerate(plan["scenes"], 1):
-            line = f"{i}. [{sc.get('template')}] বাক্য {sc.get('sentences')} | {sc.get('on_screen_text')}"
-            if sc.get("image_query"):
-                line += f" | ছবি: {sc['image_query']}"
-            line += f" | {sc.get('sfx')}"
-            out.append(line)
+        out.extend(plan_lines(plan))
         doubts = plan.get("doubts") or []
         out.append("")
         out.append("সন্দেহজনক দাবি:" if doubts else "সন্দেহজনক দাবি: নেই")
@@ -273,13 +329,78 @@ def handle_plan(chat_id, text):
             out.append("পরিকল্পনায় সমস্যা:")
             out.extend(f"- {p}" for p in probs)
         tg_send(chat_id, "\n".join(out))
-        with open("plan.json", "rb") as f:
-            requests.post(
-                f"{TG}/sendDocument",
-                data={"chat_id": chat_id, "caption": "plan.json"},
-                files={"document": f},
-                timeout=60,
-            )
+        tg_send_doc(chat_id, "plan.json", "plan.json")
+    except Exception as e:
+        tg_send(chat_id, f"ত্রুটি:\n{str(e)[:600]}")
+
+
+def handle_video(chat_id, text):
+    m = VIDEO_CMD.match(text)
+    wide = bool(m.group(1))
+    body = text[m.end():].strip()
+    if not body:
+        tg_send(chat_id, "লিখুন: ভিডিও: আপনার স্ক্রিপ্ট")
+        return
+    sentences = split_sentences(body)
+    if len(sentences) > 20:
+        tg_send(chat_id, f"বাক্য অনেক বেশি ({to_bn(len(sentences))}টা)। একবারে ২০টার বেশি নিতে পারব না।")
+        return
+    voice = "Sulafat"
+    tg_send(
+        chat_id,
+        f"{to_bn(len(sentences))}টা বাক্য পেয়েছি। পরিকল্পনা আর ভয়েস বানাচ্ছি, কয়েক মিনিট লাগবে...",
+    )
+    try:
+        numbered = "\n".join(f"{i}. {s}" for i, s in enumerate(sentences, 1))
+        plan = ask_plan(numbered)
+        plan["ratio"] = "16:9" if wide else "9:16"
+        plan["sentences"] = sentences
+        probs = check_plan(plan, len(sentences))
+
+        os.makedirs("video/public", exist_ok=True)
+        timings, total, models = build_voice(sentences, voice, "video/public/voice.mp3")
+
+        scenes = plan["scenes"]
+        for i, sc in enumerate(scenes):
+            first = sc["sentences"][0] - 1
+            start = timings[first]["start"]
+            if i + 1 < len(scenes):
+                nxt = scenes[i + 1]["sentences"][0] - 1
+                end = timings[nxt]["start"]
+            else:
+                end = round(total + TAIL_SECONDS, 2)
+            sc["start_sec"] = round(start, 2)
+            sc["end_sec"] = round(end, 2)
+            sc["duration_sec"] = round(end - start, 2)
+            sc["duration_frames"] = max(1, int(round((end - start) * FPS)))
+        plan["sentence_timings"] = timings
+        plan["voice"] = voice
+        plan["fps"] = FPS
+        plan["total_sec"] = round(total + TAIL_SECONDS, 2)
+        plan["total_frames"] = sum(sc["duration_frames"] for sc in scenes)
+
+        with open("video/public/plan.json", "w", encoding="utf-8") as f:
+            json.dump(plan, f, ensure_ascii=False, indent=2)
+        with open("plan.json", "w", encoding="utf-8") as f:
+            json.dump(plan, f, ensure_ascii=False, indent=2)
+        with open("video_ready.flag", "w") as f:
+            f.write("ok")
+
+        tg_send_audio(chat_id, "video/public/voice.mp3", f"ভিডিওর ভয়েস ({voice}) {', '.join(models)}")
+        out = [f"শিরোনাম: {plan.get('title', '')}", f"মাপ: {plan['ratio']}", ""]
+        out.extend(plan_lines(plan))
+        out.append("")
+        out.append(to_bn(f"মোট: {plan['total_sec']} সেকেন্ড, {plan['total_frames']} ফ্রেম"))
+        doubts = plan.get("doubts") or []
+        out.append("")
+        out.append("সন্দেহজনক দাবি:" if doubts else "সন্দেহজনক দাবি: নেই")
+        out.extend(f"- {d}" for d in doubts)
+        if probs:
+            out.append("")
+            out.append("পরিকল্পনায় সমস্যা:")
+            out.extend(f"- {p}" for p in probs)
+        tg_send(chat_id, "\n".join(out))
+        tg_send_doc(chat_id, "plan.json", "plan.json (সময়সহ)")
     except Exception as e:
         tg_send(chat_id, f"ত্রুটি:\n{str(e)[:600]}")
 
@@ -300,45 +421,15 @@ def handle_timing(chat_id, text):
         f"{to_bn(len(sentences))}টা বাক্য পেয়েছি। প্রতিটার ভয়েস বানাচ্ছি ({voice}), কয়েক মিনিট লাগতে পারে...",
     )
     try:
-        gap = b"\x00\x00" * int(SAMPLE_RATE * GAP_SECONDS)
-        pcm_all = b""
-        t = 0.0
+        timings, total, models = build_voice(sentences, voice, "all.mp3")
         lines = []
-        models_used = set()
-        for i, s in enumerate(sentences, 1):
-            wav = f"s{i}.wav"
-            model = tts_gemini_retry(s, voice, wav)
-            models_used.add(model)
-            with wave.open(wav, "rb") as w:
-                n = w.getnframes()
-                frames = w.readframes(n)
-                dur = n / w.getframerate()
-            start = t
-            end = t + dur
+        for i, (s, tm) in enumerate(zip(sentences, timings), 1):
             short = s if len(s) <= 25 else s[:25] + "…"
-            lines.append(
-                to_bn(f"{i}. {start:.1f} → {end:.1f} ({dur:.1f} সেকেন্ড) {short}")
-            )
-            pcm_all += frames
-            t = end
-            if i < len(sentences):
-                pcm_all += gap
-                t += GAP_SECONDS
-            time.sleep(3)
-        with wave.open("all.wav", "wb") as w:
-            w.setnchannels(1)
-            w.setsampwidth(2)
-            w.setframerate(SAMPLE_RATE)
-            w.writeframes(pcm_all)
-        subprocess.run(
-            ["ffmpeg", "-y", "-i", "all.wav", "-b:a", "128k", "all.mp3"],
-            check=True,
-            capture_output=True,
-        )
-        models_text = ", ".join(sorted(models_used))
-        tg_send_audio(chat_id, "all.mp3", f"সব বাক্য জোড়া ({voice}) {models_text}")
+            dur = tm["end"] - tm["start"]
+            lines.append(to_bn(f"{i}. {tm['start']:.1f} → {tm['end']:.1f} ({dur:.1f} সেকেন্ড) {short}"))
+        tg_send_audio(chat_id, "all.mp3", f"সব বাক্য জোড়া ({voice}) {', '.join(models)}")
         report = "বাক্য অনুযায়ী সময় (সেকেন্ডে):\n" + "\n".join(lines)
-        report += to_bn(f"\n\nমোট: {t:.1f} সেকেন্ড (প্রতি বাক্যের মাঝে {GAP_SECONDS} সেকেন্ড বিরতি ধরে)")
+        report += to_bn(f"\n\nমোট: {total:.1f} সেকেন্ড (প্রতি বাক্যের মাঝে {GAP_SECONDS} সেকেন্ড বিরতি ধরে)")
         tg_send(chat_id, report)
     except Exception as e:
         tg_send(chat_id, f"ত্রুটি:\n{str(e)[:600]}")
@@ -440,7 +531,10 @@ def main():
         if chat_id != ALLOWED:
             continue
         if text.startswith("/start"):
-            tg_send(chat_id, "আমি রেডি। 'ভয়েস: ...', 'জেমিনি: ...', 'সময়: ...' বা 'পরিকল্পনা: ...' লিখুন, অথবা একটা টপিক পাঠান।")
+            tg_send(chat_id, "আমি রেডি। 'ভয়েস: ...', 'জেমিনি: ...', 'সময়: ...', 'পরিকল্পনা: ...' বা 'ভিডিও: ...' লিখুন, অথবা একটা টপিক পাঠান।")
+            continue
+        if VIDEO_CMD.match(text):
+            handle_video(chat_id, text)
             continue
         if PLAN_CMD.match(text):
             handle_plan(chat_id, text)
