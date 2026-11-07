@@ -34,6 +34,13 @@ SAMPLE_RATE = 24000
 GAP_SECONDS = 0.4
 TAIL_SECONDS = 0.8
 FPS = 30
+MIN_IMG_KB = 200
+BAD_TITLE = re.compile(
+    r"chart|graph|diagram|logo|infographic|poster|table|schematic|map of|timeline|"
+    r"seal|emblem|badge|patch|screenshot|icon|flag",
+    re.I,
+)
+UA = {"User-Agent": "TopicsBanglaAgent/1.0 (personal space video project)"}
 
 PLAN_SYSTEM = """তুমি "টপিকস বাংলা" মহাকাশ পেজের ভিডিও পরিচালক। ইউজার একটি বাংলা স্ক্রিপ্ট দেবে। তুমি শুধু দৃশ্য-পরিকল্পনা JSON আকারে দেবে। কোড লিখবে না, কোনো প্রশ্ন করবে না।
 
@@ -51,8 +58,9 @@ PLAN_SYSTEM = """তুমি "টপিকস বাংলা" মহাকা�
 - টেকনিক্যাল শব্দ ও নাম ইংরেজিতে রাখা যাবে।
 
 ৩. ছবি
-- image_kenburns সিনে image_query দেবে: ইংরেজি ২-৪ শব্দের সার্চ (যেমন "Saturn rings Cassini")। অন্য সিনে image_query ফাঁকা রাখবে।
-- শুধু NASA, ESA বা অন্য পাবলিক সোর্স। সোর্সের নাম image_sources তালিকায় রাখবে।
+- প্রতিটি সিনে image_queries দেবে: ৩টি আলাদা ইংরেজি সার্চ (প্রতিটি ২-৪ শব্দ), সিনের বিষয়ের ছবির জন্য। প্রথমটি সবচেয়ে নির্দিষ্ট, শেষটি সবচেয়ে সাধারণ (যেমন ["Saturn rings Cassini", "Saturn planet", "ringed planet"])।
+- শুধু বাস্তব মহাকাশ ছবির সার্চ দেবে। চার্ট, ডায়াগ্রাম, লোগো নয়।
+- image_sources তালিকা ফাঁকা রাখবে, সিস্টেম নিজে ভরবে।
 
 ৪. সাউন্ড
 - প্রতি সিনে sfx: pop, whoosh, click, chime অথবা none। পুরো ভিডিওতে ৫-৭টির বেশি নয় (none গোনা হবে না)।
@@ -61,7 +69,7 @@ PLAN_SYSTEM = """তুমি "টপিকস বাংলা" মহাকা�
 {
   "title": "ছোট শিরোনাম (পোস্টের জন্য)",
   "scenes": [
-    {"sentences": [1,2], "template": "hook", "on_screen_text": "...", "image_query": "", "sfx": "whoosh"}
+    {"sentences": [1,2], "template": "hook", "on_screen_text": "...", "image_queries": ["...", "...", "..."], "sfx": "whoosh"}
   ],
   "doubts": ["সন্দেহজনক দাবি, বাক্য নম্বরসহ"],
   "image_sources": []
@@ -115,75 +123,163 @@ def tg_send_photo(chat_id, path, caption=""):
         tg_send_doc(chat_id, path, caption)
 
 
-def fetch_nasa_image(query, out_path):
-    """NASA ছবির লাইব্রেরি থেকে ছবি খুঁজে নামায়। তথ্যের ডিকশনারি ফেরত দেয়।"""
+def clean_query(q):
+    q = q.strip().strip("।.!?,;:")
+    return re.sub(r"\s+", " ", q)
+
+
+def download(url, min_kb):
+    try:
+        img = requests.get(url, headers=UA, timeout=90)
+    except Exception:
+        return None
+    if img.status_code != 200:
+        return None
+    if len(img.content) < min_kb * 1024:
+        return None
+    ctype = img.headers.get("content-type", "")
+    if ctype and not ctype.startswith("image/"):
+        return None
+    return img.content
+
+
+def nasa_search(query, out_path):
     r = requests.get(
         "https://images-api.nasa.gov/search",
         params={"q": query, "media_type": "image"},
+        headers=UA,
         timeout=30,
     )
     r.raise_for_status()
     items = r.json().get("collection", {}).get("items", [])
-    if not items:
-        raise RuntimeError("NASA-তে এই সার্চে ছবি পাওয়া যায়নি")
-    tried = 0
-    for it in items[:6]:
-        tried += 1
+    for it in items[:10]:
         data = it["data"][0]
         nid = data.get("nasa_id")
-        if not nid:
+        title = data.get("title", "")
+        if not nid or BAD_TITLE.search(title):
             continue
         try:
-            a = requests.get(f"https://images-api.nasa.gov/asset/{nid}", timeout=30)
+            a = requests.get(f"https://images-api.nasa.gov/asset/{nid}", headers=UA, timeout=30)
             a.raise_for_status()
             hrefs = [x["href"] for x in a.json()["collection"]["items"]]
         except Exception:
             continue
-        pick = None
-        for key in ("~large.jpg", "~medium.jpg", "~small.jpg"):
-            for h in hrefs:
-                if h.lower().endswith(key):
-                    pick = h
-                    break
-            if pick:
-                break
-        if not pick:
+        for key in ("~large.jpg", "~medium.jpg"):
+            pick = next((h for h in hrefs if h.lower().endswith(key)), None)
+            if not pick:
+                continue
+            pick = pick.replace("http://", "https://")
+            content = download(pick, MIN_IMG_KB)
+            if content:
+                with open(out_path, "wb") as f:
+                    f.write(content)
+                return {
+                    "source": "NASA",
+                    "title": title,
+                    "id": nid,
+                    "license": "NASA media (ক্রেডিট: NASA)",
+                    "credit": f"NASA ({data.get('center', '')})".replace(" ()", ""),
+                    "url": f"https://images.nasa.gov/details/{nid}",
+                    "kb": round(len(content) / 1024),
+                }
+    return None
+
+
+def strip_html(s):
+    return re.sub(r"<[^>]+>", "", s or "").strip()
+
+
+OK_LICENSE = re.compile(r"public domain|^pd|cc0|cc[- ]by|cc[- ]by[- ]sa", re.I)
+NO_LICENSE = re.compile(r"\bnc\b|noncommercial|\bnd\b|noderiv|fair use|non-free", re.I)
+
+
+def wikimedia_search(query, out_path):
+    r = requests.get(
+        "https://commons.wikimedia.org/w/api.php",
+        params={
+            "action": "query",
+            "generator": "search",
+            "gsrsearch": f"{query} filetype:bitmap",
+            "gsrnamespace": 6,
+            "gsrlimit": 10,
+            "prop": "imageinfo",
+            "iiprop": "url|size|extmetadata",
+            "iiurlwidth": 2000,
+            "format": "json",
+        },
+        headers=UA,
+        timeout=30,
+    )
+    r.raise_for_status()
+    pages = r.json().get("query", {}).get("pages", {})
+    for p in sorted(pages.values(), key=lambda x: x.get("index", 99)):
+        title = p.get("title", "")
+        if BAD_TITLE.search(title):
             continue
-        pick = pick.replace("http://", "https://")
-        try:
-            img = requests.get(pick, timeout=90)
-        except Exception:
+        info = (p.get("imageinfo") or [None])[0]
+        if not info:
             continue
-        if img.status_code != 200 or len(img.content) < 5000:
+        meta = info.get("extmetadata", {})
+        lic = strip_html(meta.get("LicenseShortName", {}).get("value", ""))
+        if not lic or NO_LICENSE.search(lic) or not OK_LICENSE.search(lic):
+            continue
+        if info.get("width", 0) < 1000 or info.get("height", 0) < 1000:
+            continue
+        url = info.get("thumburl") or info.get("url")
+        content = download(url, MIN_IMG_KB)
+        if not content:
             continue
         with open(out_path, "wb") as f:
-            f.write(img.content)
+            f.write(content)
+        artist = strip_html(meta.get("Artist", {}).get("value", "")) or "অজানা"
         return {
-            "title": data.get("title", ""),
-            "nasa_id": nid,
-            "center": data.get("center", ""),
-            "date": str(data.get("date_created", ""))[:10],
-            "url": pick,
-            "kb": round(len(img.content) / 1024),
-            "credit": "NASA",
+            "source": "Wikimedia Commons",
+            "title": title.replace("File:", ""),
+            "id": title,
+            "license": lic,
+            "credit": artist[:80],
+            "url": info.get("descriptionurl", ""),
+            "kb": round(len(content) / 1024),
         }
-    raise RuntimeError(f"{tried}টা ফলাফলের কোনোটার ছবি নামানো গেল না")
+    return None
+
+
+def find_image(queries, out_path):
+    """সার্চের তালিকা ধরে NASA, তারপর Wikimedia-তে খোঁজে। না মিললে None।"""
+    for q in queries:
+        q = clean_query(q)
+        if not q:
+            continue
+        for fn in (nasa_search, wikimedia_search):
+            try:
+                info = fn(q, out_path)
+            except Exception:
+                info = None
+            if info:
+                info["query"] = q
+                return info
+    return None
 
 
 def handle_image(chat_id, text):
     m = IMG_CMD.match(text)
-    query = text[m.end():].strip()
-    if not query:
+    raw = text[m.end():].strip()
+    queries = [clean_query(x) for x in raw.split("|") if clean_query(x)]
+    if not queries:
         tg_send(chat_id, "লিখুন: ছবি: Milky Way galaxy")
         return
-    tg_send(chat_id, f"NASA-তে খুঁজছি: {query}")
+    tg_send(chat_id, "খুঁজছি: " + " | ".join(queries))
     try:
-        info = fetch_nasa_image(query, "img_test.jpg")
+        info = find_image(queries, "img_test.jpg")
+        if not info:
+            tg_send(chat_id, "কোনো সোর্সে উপযুক্ত ছবি পাওয়া যায়নি (NASA ও Wikimedia দুটোতেই দেখেছি)।")
+            return
         cap = (
             f"{info['title']}\n"
-            f"NASA ID: {info['nasa_id']}\n"
-            f"কেন্দ্র: {info['center']} | তারিখ: {info['date']}\n"
-            f"ক্রেডিট: {info['credit']} | {info['kb']} KB"
+            f"সোর্স: {info['source']} | সার্চ: {info['query']}\n"
+            f"লাইসেন্স: {info['license']}\n"
+            f"ক্রেডিট: {info['credit']} | {info['kb']} KB\n"
+            f"{info['url']}"
         )
         tg_send_photo(chat_id, "img_test.jpg", cap)
     except Exception as e:
@@ -362,8 +458,9 @@ def check_plan(plan, n_sent):
             probs.append(f"সিন {i}: স্ক্রিনের লেখা ৬ শব্দের বেশি")
         if t == "number_counter" and not re.search(r"[0-9০-৯]", str(sc.get("on_screen_text", ""))):
             probs.append(f"সিন {i}: number_counter-এ সংখ্যা নেই")
-        if t == "image_kenburns" and not sc.get("image_query"):
-            probs.append(f"সিন {i}: image_query নেই")
+        qs = sc.get("image_queries")
+        if not isinstance(qs, list) or not qs:
+            probs.append(f"সিন {i}: image_queries নেই")
         used.extend(sc.get("sentences", []))
     if scenes[0].get("template") != "hook":
         probs.append("প্রথম সিন hook নয়")
@@ -380,8 +477,10 @@ def plan_lines(plan):
     out = []
     for i, sc in enumerate(plan["scenes"], 1):
         line = f"{i}. [{sc.get('template')}] বাক্য {sc.get('sentences')} | {sc.get('on_screen_text')}"
-        if sc.get("image_query"):
-            line += f" | ছবি: {sc['image_query']}"
+        if sc.get("image_file"):
+            line += f" | ছবি ✓ ({sc.get('image_source')})"
+        elif "image_file" in sc:
+            line += " | ছবি ✗ (মোশন গ্রাফিক্স)"
         line += f" | {sc.get('sfx')}"
         if "duration_sec" in sc:
             line += f" | {sc['start_sec']}→{sc['end_sec']} ({sc['duration_sec']}s)"
@@ -436,7 +535,7 @@ def handle_video(chat_id, text):
     voice = "Sulafat"
     tg_send(
         chat_id,
-        f"{to_bn(len(sentences))}টা বাক্য পেয়েছি। পরিকল্পনা আর ভয়েস বানাচ্ছি, কয়েক মিনিট লাগবে...",
+        f"{to_bn(len(sentences))}টা বাক্য পেয়েছি। পরিকল্পনা, ভয়েস আর ছবি জোগাড় করছি, কয়েক মিনিট লাগবে...",
     )
     try:
         numbered = "\n".join(f"{i}. {s}" for i, s in enumerate(sentences, 1))
@@ -467,6 +566,33 @@ def handle_video(chat_id, text):
         plan["total_sec"] = round(total + TAIL_SECONDS, 2)
         plan["total_frames"] = sum(sc["duration_frames"] for sc in scenes)
 
+        credits = []
+        used_ids = set()
+        for i, sc in enumerate(scenes, 1):
+            qs = sc.get("image_queries") or []
+            fname = f"scene{i}.jpg"
+            info = find_image(qs, f"video/public/{fname}") if qs else None
+            if info and info["id"] in used_ids:
+                info = None
+                try:
+                    os.remove(f"video/public/{fname}")
+                except OSError:
+                    pass
+            if info:
+                used_ids.add(info["id"])
+                sc["image_file"] = fname
+                sc["image_source"] = info["source"]
+                sc["image_title"] = info["title"]
+                sc["image_license"] = info["license"]
+                sc["image_credit"] = info["credit"]
+                sc["image_url"] = info["url"]
+                credits.append(
+                    f"সিন {i}: {info['title']} | {info['source']} | {info['license']} | {info['credit']}\n{info['url']}"
+                )
+            else:
+                sc["image_file"] = ""
+        plan["image_sources"] = sorted({sc["image_source"] for sc in scenes if sc.get("image_file")})
+
         with open("video/public/plan.json", "w", encoding="utf-8") as f:
             json.dump(plan, f, ensure_ascii=False, indent=2)
         with open("plan.json", "w", encoding="utf-8") as f:
@@ -488,7 +614,11 @@ def handle_video(chat_id, text):
             out.append("পরিকল্পনায় সমস্যা:")
             out.extend(f"- {p}" for p in probs)
         tg_send(chat_id, "\n".join(out))
-        tg_send_doc(chat_id, "plan.json", "plan.json (সময়সহ)")
+        if credits:
+            tg_send(chat_id, "ছবির ক্রেডিট (পোস্টের আগে লিংকে লাইসেন্স একবার দেখে নিন):\n\n" + "\n\n".join(credits))
+        else:
+            tg_send(chat_id, "কোনো সিনেই উপযুক্ত ছবি পাওয়া যায়নি, সব সিনে মোশন গ্রাফিক্স থাকবে।")
+        tg_send_doc(chat_id, "plan.json", "plan.json (সময় ও ছবিসহ)")
     except Exception as e:
         tg_send(chat_id, f"ত্রুটি:\n{str(e)[:600]}")
 
