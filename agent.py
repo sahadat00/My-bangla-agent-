@@ -1,4 +1,6 @@
 import os
+import re
+import asyncio
 import requests
 
 TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
@@ -9,7 +11,10 @@ MODELS = [
     "gemini-2.5-flash",
     "gemini-3-flash-preview",
 ]
+VOICES_F = ["bn-BD-NabanitaNeural", "bn-IN-TanishaaNeural"]
+VOICES_M = ["bn-BD-PradeepNeural", "bn-IN-BashkarNeural"]
 TG = f"https://api.telegram.org/bot{TOKEN}"
+VOICE_CMD = re.compile(r"^ভয়েস(-ছেলে)?\s*[:ঃ]?\s*", re.S)
 
 
 def tg_send(chat_id, text):
@@ -18,6 +23,60 @@ def tg_send(chat_id, text):
         json={"chat_id": chat_id, "text": text[:4000]},
         timeout=30,
     )
+
+
+def tg_send_audio(chat_id, path, caption=""):
+    with open(path, "rb") as f:
+        r = requests.post(
+            f"{TG}/sendAudio",
+            data={"chat_id": chat_id, "caption": caption[:200]},
+            files={"audio": f},
+            timeout=180,
+        )
+    r.raise_for_status()
+
+
+def tts_edge(text, voice, path):
+    import edge_tts
+
+    async def run():
+        await edge_tts.Communicate(text, voice).save(path)
+
+    asyncio.run(run())
+    if os.path.getsize(path) < 1000:
+        raise RuntimeError("empty audio")
+
+
+def tts_gtts(text, path):
+    from gtts import gTTS
+
+    gTTS(text=text, lang="bn").save(path)
+
+
+def handle_voice(chat_id, text):
+    m = VOICE_CMD.match(text)
+    male = bool(m.group(1))
+    body = text[m.end():].strip()
+    if not body:
+        tg_send(chat_id, "লিখুন: ভয়েস: আপনার স্ক্রিপ্ট")
+        return
+    tg_send(chat_id, "ভয়েস বানাচ্ছি...")
+    path = "voice.mp3"
+    last_err = None
+    for v in (VOICES_M if male else VOICES_F):
+        try:
+            tts_edge(body, v, path)
+            tg_send_audio(chat_id, path, f"ভয়েস: {v}")
+            return
+        except Exception as e:
+            last_err = e
+    try:
+        tts_gtts(body, path)
+        tg_send_audio(chat_id, path, "ভয়েস: gTTS (বিকল্প)")
+        return
+    except Exception as e:
+        last_err = e
+    tg_send(chat_id, f"ত্রুটি: {type(last_err).__name__}: {str(last_err)[:200]}")
 
 
 def short_error(r):
@@ -77,7 +136,10 @@ def main():
         if chat_id != ALLOWED:
             continue
         if text.startswith("/start"):
-            tg_send(chat_id, "আমি রেডি। একটা মহাকাশের টপিক পাঠান।")
+            tg_send(chat_id, "আমি রেডি। 'ভয়েস: স্ক্রিপ্ট' লিখে ভয়েস পান, অথবা একটা টপিক পাঠান।")
+            continue
+        if VOICE_CMD.match(text):
+            handle_voice(chat_id, text)
             continue
         try:
             tg_send(chat_id, "স্ক্রিপ্ট লিখছি...")
