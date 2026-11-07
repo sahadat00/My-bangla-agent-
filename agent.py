@@ -4,7 +4,11 @@ import requests
 TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 GEMINI_KEY = os.environ["GEMINI_API_KEY"]
 ALLOWED = os.environ.get("ALLOWED_CHAT_ID", "").strip()
-MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash-lite")
+MODELS = [
+    "gemini-2.5-flash-lite",
+    "gemini-2.5-flash",
+    "gemini-3-flash-preview",
+]
 TG = f"https://api.telegram.org/bot{TOKEN}"
 
 
@@ -14,6 +18,13 @@ def tg_send(chat_id, text):
         json={"chat_id": chat_id, "text": text[:4000]},
         timeout=30,
     )
+
+
+def short_error(r):
+    try:
+        return r.json()["error"]["message"][:150]
+    except Exception:
+        return r.text[:150]
 
 
 def ask_gemini(topic):
@@ -26,15 +37,21 @@ def ask_gemini(topic):
         "- শুধু নিশ্চিত ও প্রতিষ্ঠিত তথ্য দাও। কোনো সংখ্যা বা দূরত্ব নিয়ে নিশ্চিত না হলে সেটা বাদ দাও।\n"
         "- শেষে আলাদা লাইনে 'যাচাই করার তথ্য:' লিখে স্ক্রিপ্টের সব সংখ্যা ও দাবির তালিকা দাও।"
     )
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL}:generateContent"
-    r = requests.post(
-        url,
-        headers={"x-goog-api-key": GEMINI_KEY},
-        json={"contents": [{"parts": [{"text": prompt}]}]},
-        timeout=120,
-    )
-    r.raise_for_status()
-    return r.json()["candidates"][0]["content"]["parts"][0]["text"]
+    errors = []
+    for model in MODELS:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+        r = requests.post(
+            url,
+            headers={"x-goog-api-key": GEMINI_KEY},
+            json={"contents": [{"parts": [{"text": prompt}]}]},
+            timeout=120,
+        )
+        if r.status_code == 200:
+            return r.json()["candidates"][0]["content"]["parts"][0]["text"]
+        errors.append(f"{model} -> {r.status_code}: {short_error(r)}")
+        if r.status_code in (400, 401, 403):
+            break
+    raise RuntimeError("\n".join(errors))
 
 
 def main():
@@ -63,7 +80,7 @@ def main():
             tg_send(chat_id, "স্ক্রিপ্ট লিখছি...")
             tg_send(chat_id, ask_gemini(text))
         except Exception as e:
-            tg_send(chat_id, f"ত্রুটি হয়েছে: {type(e).__name__}")
+            tg_send(chat_id, f"ত্রুটি:\n{e}")
     requests.get(
         f"{TG}/getUpdates",
         params={"offset": last_id + 1, "timeout": 0},
