@@ -6,12 +6,15 @@ on:
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
       - run: sudo apt-get update && sudo apt-get install -y ffmpeg
       - run: pip install requests edge-tts gTTS
       - run: python agent.py
@@ -19,3 +22,17 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           ALLOWED_CHAT_ID: ${{ secrets.ALLOWED_CHAT_ID }}
+      - name: Render video
+        if: hashFiles('video_ready.flag') != ''
+        working-directory: video
+        run: |
+          npm install
+          npx remotion render src/index.tsx Main out.mp4
+      - name: Send video
+        if: hashFiles('video_ready.flag') != ''
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          ALLOWED_CHAT_ID: ${{ secrets.ALLOWED_CHAT_ID }}
+        run: |
+          ls -la video/out.mp4
+          curl -s -F chat_id="$ALLOWED_CHAT_ID" -F video=@video/out.mp4 -F caption="ভিডিও প্রিভিউ" "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendVideo"
