@@ -28,6 +28,7 @@ GEM_CMD = re.compile(r"^জেমিনি(?:-([A-Za-z]+))?\s*[:ঃ]\s*", re.S)
 TIME_CMD = re.compile(r"^সময়(?:-([A-Za-z]+))?\s*[:ঃ]\s*", re.S)
 PLAN_CMD = re.compile(r"^পরিকল্পনা(-লম্বা)?\s*[:ঃ]\s*", re.S)
 VIDEO_CMD = re.compile(r"^ভিডিও(-লম্বা)?\s*[:ঃ]\s*", re.S)
+IMG_CMD = re.compile(r"^ছবি\s*[:ঃ]\s*", re.S)
 BN_DIGITS = str.maketrans("0123456789", "০১২৩৪৫৬৭৮৯")
 SAMPLE_RATE = 24000
 GAP_SECONDS = 0.4
@@ -100,6 +101,93 @@ def tg_send_doc(chat_id, path, caption=""):
             files={"document": f},
             timeout=60,
         )
+
+
+def tg_send_photo(chat_id, path, caption=""):
+    with open(path, "rb") as f:
+        r = requests.post(
+            f"{TG}/sendPhoto",
+            data={"chat_id": chat_id, "caption": caption[:1000]},
+            files={"photo": f},
+            timeout=120,
+        )
+    if r.status_code != 200:
+        tg_send_doc(chat_id, path, caption)
+
+
+def fetch_nasa_image(query, out_path):
+    """NASA ছবির লাইব্রেরি থেকে ছবি খুঁজে নামায়। তথ্যের ডিকশনারি ফেরত দেয়।"""
+    r = requests.get(
+        "https://images-api.nasa.gov/search",
+        params={"q": query, "media_type": "image"},
+        timeout=30,
+    )
+    r.raise_for_status()
+    items = r.json().get("collection", {}).get("items", [])
+    if not items:
+        raise RuntimeError("NASA-তে এই সার্চে ছবি পাওয়া যায়নি")
+    tried = 0
+    for it in items[:6]:
+        tried += 1
+        data = it["data"][0]
+        nid = data.get("nasa_id")
+        if not nid:
+            continue
+        try:
+            a = requests.get(f"https://images-api.nasa.gov/asset/{nid}", timeout=30)
+            a.raise_for_status()
+            hrefs = [x["href"] for x in a.json()["collection"]["items"]]
+        except Exception:
+            continue
+        pick = None
+        for key in ("~large.jpg", "~medium.jpg", "~small.jpg"):
+            for h in hrefs:
+                if h.lower().endswith(key):
+                    pick = h
+                    break
+            if pick:
+                break
+        if not pick:
+            continue
+        pick = pick.replace("http://", "https://")
+        try:
+            img = requests.get(pick, timeout=90)
+        except Exception:
+            continue
+        if img.status_code != 200 or len(img.content) < 5000:
+            continue
+        with open(out_path, "wb") as f:
+            f.write(img.content)
+        return {
+            "title": data.get("title", ""),
+            "nasa_id": nid,
+            "center": data.get("center", ""),
+            "date": str(data.get("date_created", ""))[:10],
+            "url": pick,
+            "kb": round(len(img.content) / 1024),
+            "credit": "NASA",
+        }
+    raise RuntimeError(f"{tried}টা ফলাফলের কোনোটার ছবি নামানো গেল না")
+
+
+def handle_image(chat_id, text):
+    m = IMG_CMD.match(text)
+    query = text[m.end():].strip()
+    if not query:
+        tg_send(chat_id, "লিখুন: ছবি: Milky Way galaxy")
+        return
+    tg_send(chat_id, f"NASA-তে খুঁজছি: {query}")
+    try:
+        info = fetch_nasa_image(query, "img_test.jpg")
+        cap = (
+            f"{info['title']}\n"
+            f"NASA ID: {info['nasa_id']}\n"
+            f"কেন্দ্র: {info['center']} | তারিখ: {info['date']}\n"
+            f"ক্রেডিট: {info['credit']} | {info['kb']} KB"
+        )
+        tg_send_photo(chat_id, "img_test.jpg", cap)
+    except Exception as e:
+        tg_send(chat_id, f"ত্রুটি:\n{str(e)[:600]}")
 
 
 def tts_edge(text, voice, path):
@@ -531,7 +619,10 @@ def main():
         if chat_id != ALLOWED:
             continue
         if text.startswith("/start"):
-            tg_send(chat_id, "আমি রেডি। 'ভয়েস: ...', 'জেমিনি: ...', 'সময়: ...', 'পরিকল্পনা: ...' বা 'ভিডিও: ...' লিখুন, অথবা একটা টপিক পাঠান।")
+            tg_send(chat_id, "আমি রেডি। 'ভয়েস: ...', 'জেমিনি: ...', 'সময়: ...', 'পরিকল্পনা: ...', 'ছবি: ...' বা 'ভিডিও: ...' লিখুন, অথবা একটা টপিক পাঠান।")
+            continue
+        if IMG_CMD.match(text):
+            handle_image(chat_id, text)
             continue
         if VIDEO_CMD.match(text):
             handle_video(chat_id, text)
