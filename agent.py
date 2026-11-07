@@ -1,5 +1,6 @@
 import os
 import re
+import time
 import wave
 import base64
 import asyncio
@@ -23,6 +24,10 @@ VOICES_M = ["bn-BD-PradeepNeural", "bn-IN-BashkarNeural"]
 TG = f"https://api.telegram.org/bot{TOKEN}"
 VOICE_CMD = re.compile(r"^ভয়েস(-ছেলে)?\s*[:ঃ]?\s*", re.S)
 GEM_CMD = re.compile(r"^জেমিনি(?:-([A-Za-z]+))?\s*[:ঃ]\s*", re.S)
+TIME_CMD = re.compile(r"^সময়(?:-([A-Za-z]+))?\s*[:ঃ]\s*", re.S)
+BN_DIGITS = str.maketrans("0123456789", "০১২৩৪৫৬৭৮৯")
+SAMPLE_RATE = 24000
+GAP_SECONDS = 0.4
 
 
 def tg_send(chat_id, text):
@@ -95,10 +100,93 @@ def tts_gemini(text, voice, wav_path):
         with wave.open(wav_path, "wb") as w:
             w.setnchannels(1)
             w.setsampwidth(2)
-            w.setframerate(24000)
+            w.setframerate(SAMPLE_RATE)
             w.writeframes(pcm)
         return model
     raise RuntimeError("\n".join(errors))
+
+
+def tts_gemini_retry(text, voice, wav_path):
+    last = None
+    for attempt in range(3):
+        try:
+            return tts_gemini(text, voice, wav_path)
+        except RuntimeError as e:
+            last = e
+            if "429" in str(e) and attempt < 2:
+                time.sleep(30)
+                continue
+            raise
+    raise last
+
+
+def split_sentences(body):
+    parts = re.split(r"(?<=[।?!])\s+|\n+", body)
+    return [p.strip() for p in parts if p.strip()]
+
+
+def to_bn(s):
+    return str(s).translate(BN_DIGITS)
+
+
+def handle_timing(chat_id, text):
+    m = TIME_CMD.match(text)
+    voice = m.group(1) or "Sulafat"
+    body = text[m.end():].strip()
+    if not body:
+        tg_send(chat_id, "লিখুন: সময়: আপনার স্ক্রিপ্ট")
+        return
+    sentences = split_sentences(body)
+    if len(sentences) > 25:
+        tg_send(chat_id, f"বাক্য অনেক বেশি ({len(sentences)}টা)। একবারে ২৫টার বেশি নিতে পারব না।")
+        return
+    tg_send(
+        chat_id,
+        f"{to_bn(len(sentences))}টা বাক্য পেয়েছি। প্রতিটার ভয়েস বানাচ্ছি ({voice}), কয়েক মিনিট লাগতে পারে...",
+    )
+    try:
+        gap = b"\x00\x00" * int(SAMPLE_RATE * GAP_SECONDS)
+        pcm_all = b""
+        t = 0.0
+        lines = []
+        models_used = set()
+        for i, s in enumerate(sentences, 1):
+            wav = f"s{i}.wav"
+            model = tts_gemini_retry(s, voice, wav)
+            models_used.add(model)
+            with wave.open(wav, "rb") as w:
+                n = w.getnframes()
+                frames = w.readframes(n)
+                dur = n / w.getframerate()
+            start = t
+            end = t + dur
+            short = s if len(s) <= 25 else s[:25] + "…"
+            lines.append(
+                to_bn(f"{i}. {start:.1f} → {end:.1f} ({dur:.1f} সেকেন্ড) {short}")
+            )
+            pcm_all += frames
+            t = end
+            if i < len(sentences):
+                pcm_all += gap
+                t += GAP_SECONDS
+            time.sleep(3)
+        with wave.open("all.wav", "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(SAMPLE_RATE)
+            w.writeframes(pcm_all)
+        subprocess.run(
+            ["ffmpeg", "-y", "-i", "all.wav", "-b:a", "128k", "all.mp3"],
+            check=True,
+            capture_output=True,
+        )
+        models_text = ", ".join(sorted(models_used))
+        tg_send_audio(chat_id, "all.mp3", f"সব বাক্য জোড়া ({voice}) {models_text}")
+        report = "বাক্য অনুযায়ী সময় (সেকেন্ডে):\n" + "\n".join(lines)
+        report += to_bn(f"\n\nমোট: {t:.1f} সেকেন্ড (প্রতি বাক্যের মাঝে {GAP_SECONDS} সেকেন্ড বিরতি ধরে)")
+        tg_send(chat_id, report)
+    except Exception as e:
+        tg_send(chat_id, f"ত্রুটি:\n{str(e)[:600]}")
 
 
 def handle_gemini(chat_id, text):
@@ -204,7 +292,10 @@ def main():
         if chat_id != ALLOWED:
             continue
         if text.startswith("/start"):
-            tg_send(chat_id, "আমি রেডি। 'ভয়েস: ...' বা 'জেমিনি: ...' লিখে ভয়েস পান, অথবা একটা টপিক পাঠান।")
+            tg_send(chat_id, "আমি রেডি। 'ভয়েস: ...', 'জেমিনি: ...' বা 'সময়: ...' লিখুন, অথবা একটা টপিক পাঠান।")
+            continue
+        if TIME_CMD.match(text):
+            handle_timing(chat_id, text)
             continue
         if GEM_CMD.match(text):
             handle_gemini(chat_id, text)
