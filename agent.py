@@ -42,7 +42,7 @@ PLAN_SYSTEM = """তুমি "টপিকস বাংলা" মহাকা�
 - স্ক্রিপ্টের বাক্যগুলো আগেই নম্বর দেওয়া আছে। প্রতি সিনে এক বা কয়েকটি পরপর বাক্য, আনুমানিক ৩-৮ সেকেন্ড। সব বাক্য কোনো না কোনো সিনে থাকতে হবে, ক্রম ঠিক রেখে।
 - টেমপ্লেট শুধু এগুলো: hook, keyword_card, number_counter, image_kenburns, process_steps, comparison, statement, closing।
 - প্রথম সিন hook, শেষ সিন closing। পরপর দুই সিনে একই টেমপ্লেট নয়।
-- number_counter শুধু স্ক্রিপ্টে থাকা সংখ্যায়।
+- number_counter শুধু তখনই, যখন স্ক্রিপ্টে নির্দিষ্ট সংখ্যা (যেমন ৮, ৩০০, ১.৫) লেখা আছে। "কোটি কোটি", "অনেক", "হাজার হাজার" এমন অনির্দিষ্ট কথায় নয়, সেখানে keyword_card বা statement দেবে। on_screen_text-এ সেই সংখ্যাটাই লিখবে।
 - on_screen_text: সিনের মূল শব্দ বা ছোট বাক্যাংশ, সর্বোচ্চ ৬ শব্দ। পুরো বাক্য স্ক্রিনে লিখবে না।
 - টেকনিক্যাল শব্দ ও নাম ইংরেজিতে রাখা যাবে।
 
@@ -224,6 +224,8 @@ def check_plan(plan, n_sent):
             sfx_count += 1
         if len(str(sc.get("on_screen_text", "")).split()) > 6:
             probs.append(f"সিন {i}: স্ক্রিনের লেখা ৬ শব্দের বেশি")
+        if t == "number_counter" and not re.search(r"[0-9০-৯]", str(sc.get("on_screen_text", ""))):
+            probs.append(f"সিন {i}: number_counter-এ সংখ্যা নেই")
         if t == "image_kenburns" and not sc.get("image_query"):
             probs.append(f"সিন {i}: image_query নেই")
         used.extend(sc.get("sentences", []))
