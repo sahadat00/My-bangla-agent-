@@ -826,7 +826,33 @@ def build_voice(sentences, voice, out_mp3):
         check=True, capture_output=True,
     )
     return timings, total, [model]
-    
+    KEYS = [k.strip() for k in GEMINI_KEY.split(",") if k.strip()]
+
+if not getattr(requests.post, "_multi_key", False):
+    _key_i = 0
+    _orig_post = requests.post
+
+    def _post(url, *args, **kwargs):
+        global _key_i
+        if "generativelanguage.googleapis.com" not in str(url):
+            return _orig_post(url, *args, **kwargs)
+        r = None
+        for step in range(len(KEYS)):
+            idx = (_key_i + step) % len(KEYS)
+            h = dict(kwargs.get("headers") or {})
+            h["x-goog-api-key"] = KEYS[idx]
+            kw = dict(kwargs)
+            kw["headers"] = h
+            r = _orig_post(url, *args, **kw)
+            if r.status_code != 429:
+                _key_i = idx
+                return r
+            print(f"চাবি {idx + 1}-এ সীমা শেষ, পরেরটা চেষ্টা করছি")
+        return r
+
+    _post._multi_key = True
+    requests.post = _post
+
 if __name__ == "__main__":
     try:
         main()
