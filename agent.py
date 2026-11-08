@@ -780,7 +780,53 @@ def main():
         timeout=30,
     )
 
+def build_voice(sentences, voice, out_mp3):
+    """পুরো স্ক্রিপ্টের ভয়েস একটা অনুরোধে বানায়, নীরব ফাঁক ধরে বাক্যের সময় বের করে।"""
+    n = len(sentences)
+    text = "\n".join(sentences)
+    model = tts_gemini(text, voice, "all.wav")
+    with wave.open("all.wav", "rb") as w:
+        total = w.getnframes() / w.getframerate()
 
+    bounds = []
+    method = "silence"
+    if n > 1:
+        p = subprocess.run(
+            ["ffmpeg", "-i", "all.wav", "-af",
+             "silencedetect=noise=-35dB:d=0.2", "-f", "null", "-"],
+            capture_output=True, text=True,
+        )
+        starts = [float(x) for x in re.findall(r"silence_start: ([0-9.]+)", p.stderr)]
+        ends = [float(x) for x in re.findall(r"silence_end: ([0-9.]+)", p.stderr)]
+        starts = starts[:len(ends)]
+        sil = [(s, e) for s, e in zip(starts, ends) if s > 0.3 and e < total - 0.3]
+        if len(sil) >= n - 1:
+            longest = sorted(sil, key=lambda x: x[1] - x[0], reverse=True)[: n - 1]
+            bounds = sorted(longest)
+        else:
+            method = "অনুপাত"
+            lens = [max(1, len(s)) for s in sentences]
+            acc = 0
+            for L in lens[:-1]:
+                acc += L
+                t = total * acc / sum(lens)
+                bounds.append((t, t))
+    print("সময় ভাগের পদ্ধতি:", method)
+
+    timings = []
+    prev_start = 0.0
+    for i in range(n):
+        end = bounds[i][0] if i < n - 1 else total
+        timings.append({"start": round(prev_start, 2), "end": round(end, 2)})
+        if i < n - 1:
+            prev_start = bounds[i][1]
+
+    subprocess.run(
+        ["ffmpeg", "-y", "-i", "all.wav", "-b:a", "128k", out_mp3],
+        check=True, capture_output=True,
+    )
+    return timings, total, [model]
+    
 if __name__ == "__main__":
     try:
         main()
