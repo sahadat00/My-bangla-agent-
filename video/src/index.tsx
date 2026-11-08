@@ -243,7 +243,7 @@ const ClosingMark: React.FC = () => {
         textShadow: "0 4px 20px rgba(0,0,0,0.7)",
       }}
     >
-      টপিকস বাংলা
+     TOP X BANGLA
     </div>
   );
 };
