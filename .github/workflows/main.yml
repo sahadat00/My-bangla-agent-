@@ -28,11 +28,29 @@ jobs:
         run: |
           npm install
           npx remotion render src/index.tsx Main out.mp4
+      - name: Compress video
+        if: hashFiles('video_ready.flag') != ''
+        run: |
+          ls -la video/out.mp4
+          DURATION=$(ffprobe -v error -show_entries format=duration -of csv=p=0 video/out.mp4)
+          AUDIO_KBPS=128
+          TOTAL_KBITS=$(python3 -c "print(int(45*8*1000))")
+          VIDEO_KBPS=$(python3 -c "d=float('$DURATION'); print(max(300, int($TOTAL_KBITS/d - $AUDIO_KBPS)))")
+          echo "Duration: $DURATION s, video bitrate: $VIDEO_KBPS kbps"
+          ffmpeg -y -i video/out.mp4 \
+            -c:v libx264 -preset veryfast \
+            -b:v ${VIDEO_KBPS}k -maxrate ${VIDEO_KBPS}k -bufsize $((VIDEO_KBPS*2))k \
+            -c:a aac -b:a ${AUDIO_KBPS}k \
+            -movflags +faststart \
+            video/small.mp4
+          ls -la video/small.mp4
       - name: Send video
         if: hashFiles('video_ready.flag') != ''
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           ALLOWED_CHAT_ID: ${{ secrets.ALLOWED_CHAT_ID }}
         run: |
-          ls -la video/out.mp4
-          curl -s -F chat_id="$ALLOWED_CHAT_ID" -F video=@video/out.mp4 -F caption="ভিডিও প্রিভিউ" "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendVideo"
+          ls -la video/small.mp4
+          RESPONSE=$(curl -s -F chat_id="$ALLOWED_CHAT_ID" -F video=@video/small.mp4 -F caption="ভিডিও প্রিভিউ" "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendVideo")
+          echo "$RESPONSE"
+          echo "$RESPONSE" | grep -q '"ok":true' || exit 1
