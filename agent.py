@@ -10,6 +10,8 @@ import requests
 
 TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 GEMINI_KEY = os.environ["GEMINI_API_KEY"]
+# একাধিক চাবি কমা দিয়ে লেখা যায়: চাবি১,চাবি২
+KEYS = [k.strip() for k in GEMINI_KEY.split(",") if k.strip()]
 ALLOWED = os.environ.get("ALLOWED_CHAT_ID", "").strip()
 MODELS = [
     "gemini-2.5-flash-lite",
@@ -41,6 +43,33 @@ BAD_TITLE = re.compile(
     re.I,
 )
 UA = {"User-Agent": "TopicsBanglaAgent/1.0 (personal space video project)"}
+
+# ---------- একাধিক Gemini চাবি: একটায় সীমা (429) শেষ হলে পরেরটা ----------
+_key_i = 0
+_orig_post = requests.post
+
+
+def _post(url, *args, **kwargs):
+    global _key_i
+    if "generativelanguage.googleapis.com" not in str(url):
+        return _orig_post(url, *args, **kwargs)
+    r = None
+    for step in range(len(KEYS)):
+        idx = (_key_i + step) % len(KEYS)
+        h = dict(kwargs.get("headers") or {})
+        h["x-goog-api-key"] = KEYS[idx]
+        kw = dict(kwargs)
+        kw["headers"] = h
+        r = _orig_post(url, *args, **kw)
+        if r.status_code != 429:
+            _key_i = idx
+            return r
+        print(f"চাবি {idx + 1}-এ সীমা শেষ, পরেরটা চেষ্টা করছি")
+    return r
+
+
+requests.post = _post
+# -------------------------------------------------------------------------
 
 PLAN_SYSTEM = """তুমি "টপিকস বাংলা" মহাকাশ পেজের ভিডিও পরিচালক। ইউজার একটি বাংলা স্ক্রিপ্ট দেবে। তুমি শুধু দৃশ্য-পরিকল্পনা JSON আকারে দেবে। কোড লিখবে না, কোনো প্রশ্ন করবে না।
 
@@ -320,7 +349,7 @@ def tts_gemini(text, voice, wav_path):
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
         r = requests.post(
             url,
-            headers={"x-goog-api-key": GEMINI_KEY},
+            headers={"x-goog-api-key": KEYS[0]},
             json={
                 "contents": [{"parts": [{"text": prompt}]}],
                 "generationConfig": {
@@ -350,20 +379,6 @@ def tts_gemini(text, voice, wav_path):
     raise RuntimeError("\n".join(errors))
 
 
-def tts_gemini_retry(text, voice, wav_path):
-    last = None
-    for attempt in range(3):
-        try:
-            return tts_gemini(text, voice, wav_path)
-        except RuntimeError as e:
-            last = e
-            if "429" in str(e) and attempt < 2:
-                time.sleep(30)
-                continue
-            raise
-    raise last
-
-
 def split_sentences(body):
     parts = re.split(r"(?<=[।?!])\s+|\n+", body)
     return [p.strip() for p in parts if p.strip()]
@@ -374,38 +389,52 @@ def to_bn(s):
 
 
 def build_voice(sentences, voice, out_mp3):
-    """প্রতিটা বাক্যের ভয়েস বানিয়ে জোড়া দেয়। (সময়ের তালিকা, মোট সময়, মডেল) ফেরত দেয়।"""
-    gap = b"\x00\x00" * int(SAMPLE_RATE * GAP_SECONDS)
-    pcm_all = b""
-    t = 0.0
+    """পুরো স্ক্রিপ্টের ভয়েস একটা অনুরোধে বানায়, নীরব ফাঁক ধরে বাক্যের সময় বের করে।
+    (সময়ের তালিকা, মোট সময়, মডেলের তালিকা) ফেরত দেয়।"""
+    n = len(sentences)
+    text = "\n".join(sentences)
+    model = tts_gemini(text, voice, "all.wav")
+    with wave.open("all.wav", "rb") as w:
+        total = w.getnframes() / w.getframerate()
+
+    bounds = []
+    method = "নীরবতা"
+    if n > 1:
+        p = subprocess.run(
+            ["ffmpeg", "-i", "all.wav", "-af",
+             "silencedetect=noise=-35dB:d=0.2", "-f", "null", "-"],
+            capture_output=True, text=True,
+        )
+        starts = [float(x) for x in re.findall(r"silence_start: ([0-9.]+)", p.stderr)]
+        ends = [float(x) for x in re.findall(r"silence_end: ([0-9.]+)", p.stderr)]
+        starts = starts[:len(ends)]
+        sil = [(s, e) for s, e in zip(starts, ends) if s > 0.3 and e < total - 0.3]
+        if len(sil) >= n - 1:
+            longest = sorted(sil, key=lambda x: x[1] - x[0], reverse=True)[: n - 1]
+            bounds = sorted(longest)
+        else:
+            method = "অনুপাত"
+            lens = [max(1, len(s)) for s in sentences]
+            acc = 0
+            for L in lens[:-1]:
+                acc += L
+                t = total * acc / sum(lens)
+                bounds.append((t, t))
+    print("সময় ভাগের পদ্ধতি:", method)
+
     timings = []
-    models_used = set()
-    for i, s in enumerate(sentences, 1):
-        wav = f"s{i}.wav"
-        model = tts_gemini_retry(s, voice, wav)
-        models_used.add(model)
-        with wave.open(wav, "rb") as w:
-            n = w.getnframes()
-            frames = w.readframes(n)
-            dur = n / w.getframerate()
-        timings.append({"start": round(t, 2), "end": round(t + dur, 2)})
-        pcm_all += frames
-        t += dur
-        if i < len(sentences):
-            pcm_all += gap
-            t += GAP_SECONDS
-        time.sleep(3)
-    with wave.open("all.wav", "wb") as w:
-        w.setnchannels(1)
-        w.setsampwidth(2)
-        w.setframerate(SAMPLE_RATE)
-        w.writeframes(pcm_all)
+    prev_start = 0.0
+    for i in range(n):
+        end = bounds[i][0] if i < n - 1 else total
+        timings.append({"start": round(prev_start, 2), "end": round(end, 2)})
+        if i < n - 1:
+            prev_start = bounds[i][1]
+
     subprocess.run(
         ["ffmpeg", "-y", "-i", "all.wav", "-b:a", "128k", out_mp3],
-        check=True,
-        capture_output=True,
+        check=True, capture_output=True,
     )
-    return timings, t, sorted(models_used)
+    return timings, total, [model]
 
 
 def ask_plan(numbered_script):
@@ -414,7 +443,7 @@ def ask_plan(numbered_script):
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
         r = requests.post(
             url,
-            headers={"x-goog-api-key": GEMINI_KEY},
+            headers={"x-goog-api-key": KEYS[0]},
             json={
                 "systemInstruction": {"parts": [{"text": PLAN_SYSTEM}]},
                 "contents": [{"parts": [{"text": numbered_script}]}],
@@ -636,7 +665,7 @@ def handle_timing(chat_id, text):
         return
     tg_send(
         chat_id,
-        f"{to_bn(len(sentences))}টা বাক্য পেয়েছি। প্রতিটার ভয়েস বানাচ্ছি ({voice}), কয়েক মিনিট লাগতে পারে...",
+        f"{to_bn(len(sentences))}টা বাক্য পেয়েছি। ভয়েস বানাচ্ছি ({voice}), কয়েক মিনিট লাগতে পারে...",
     )
     try:
         timings, total, models = build_voice(sentences, voice, "all.mp3")
@@ -647,7 +676,7 @@ def handle_timing(chat_id, text):
             lines.append(to_bn(f"{i}. {tm['start']:.1f} → {tm['end']:.1f} ({dur:.1f} সেকেন্ড) {short}"))
         tg_send_audio(chat_id, "all.mp3", f"সব বাক্য জোড়া ({voice}) {', '.join(models)}")
         report = "বাক্য অনুযায়ী সময় (সেকেন্ডে):\n" + "\n".join(lines)
-        report += to_bn(f"\n\nমোট: {total:.1f} সেকেন্ড (প্রতি বাক্যের মাঝে {GAP_SECONDS} সেকেন্ড বিরতি ধরে)")
+        report += to_bn(f"\n\nমোট: {total:.1f} সেকেন্ড")
         tg_send(chat_id, report)
     except Exception as e:
         tg_send(chat_id, f"ত্রুটি:\n{str(e)[:600]}")
@@ -717,7 +746,7 @@ def ask_gemini(topic):
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
         r = requests.post(
             url,
-            headers={"x-goog-api-key": GEMINI_KEY},
+            headers={"x-goog-api-key": KEYS[0]},
             json={"contents": [{"parts": [{"text": prompt}]}]},
             timeout=120,
         )
@@ -780,78 +809,6 @@ def main():
         timeout=30,
     )
 
-def build_voice(sentences, voice, out_mp3):
-    """পুরো স্ক্রিপ্টের ভয়েস একটা অনুরোধে বানায়, নীরব ফাঁক ধরে বাক্যের সময় বের করে।"""
-    n = len(sentences)
-    text = "\n".join(sentences)
-    model = tts_gemini(text, voice, "all.wav")
-    with wave.open("all.wav", "rb") as w:
-        total = w.getnframes() / w.getframerate()
-
-    bounds = []
-    method = "silence"
-    if n > 1:
-        p = subprocess.run(
-            ["ffmpeg", "-i", "all.wav", "-af",
-             "silencedetect=noise=-35dB:d=0.2", "-f", "null", "-"],
-            capture_output=True, text=True,
-        )
-        starts = [float(x) for x in re.findall(r"silence_start: ([0-9.]+)", p.stderr)]
-        ends = [float(x) for x in re.findall(r"silence_end: ([0-9.]+)", p.stderr)]
-        starts = starts[:len(ends)]
-        sil = [(s, e) for s, e in zip(starts, ends) if s > 0.3 and e < total - 0.3]
-        if len(sil) >= n - 1:
-            longest = sorted(sil, key=lambda x: x[1] - x[0], reverse=True)[: n - 1]
-            bounds = sorted(longest)
-        else:
-            method = "অনুপাত"
-            lens = [max(1, len(s)) for s in sentences]
-            acc = 0
-            for L in lens[:-1]:
-                acc += L
-                t = total * acc / sum(lens)
-                bounds.append((t, t))
-    print("সময় ভাগের পদ্ধতি:", method)
-
-    timings = []
-    prev_start = 0.0
-    for i in range(n):
-        end = bounds[i][0] if i < n - 1 else total
-        timings.append({"start": round(prev_start, 2), "end": round(end, 2)})
-        if i < n - 1:
-            prev_start = bounds[i][1]
-
-    subprocess.run(
-        ["ffmpeg", "-y", "-i", "all.wav", "-b:a", "128k", out_mp3],
-        check=True, capture_output=True,
-    )
-    return timings, total, [model]
-    KEYS = [k.strip() for k in GEMINI_KEY.split(",") if k.strip()]
-
-if not getattr(requests.post, "_multi_key", False):
-    _key_i = 0
-    _orig_post = requests.post
-
-    def _post(url, *args, **kwargs):
-        global _key_i
-        if "generativelanguage.googleapis.com" not in str(url):
-            return _orig_post(url, *args, **kwargs)
-        r = None
-        for step in range(len(KEYS)):
-            idx = (_key_i + step) % len(KEYS)
-            h = dict(kwargs.get("headers") or {})
-            h["x-goog-api-key"] = KEYS[idx]
-            kw = dict(kwargs)
-            kw["headers"] = h
-            r = _orig_post(url, *args, **kw)
-            if r.status_code != 429:
-                _key_i = idx
-                return r
-            print(f"চাবি {idx + 1}-এ সীমা শেষ, পরেরটা চেষ্টা করছি")
-        return r
-
-    _post._multi_key = True
-    requests.post = _post
 
 if __name__ == "__main__":
     try:
