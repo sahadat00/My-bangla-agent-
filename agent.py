@@ -71,7 +71,7 @@ def _post(url, *args, **kwargs):
 requests.post = _post
 # -------------------------------------------------------------------------
 
-PLAN_SYSTEM = """তুমি "টপিকস বাংলা" মহাকাশ পেজের ভিডিও পরিচালক। ইউজার একটি বাংলা স্ক্রিপ্ট দেবে। তুমি শুধু দৃশ্য-পরিকল্পনা JSON আকারে দেবে। কোড লিখবে না, কোনো প্রশ্ন করবে না।
+PLAN_SYSTEM = """তুমি "TOP X BANGLA" পেজের ভিডিও পরিচালক। বিষয় মহাকাশ হতে পারে, অন্য যেকোনো বিষয়ও হতে পারে। ইউজার একটি বাংলা স্ক্রিপ্ট দেবে। তুমি শুধু দৃশ্য-পরিকল্পনা JSON আকারে দেবে। কোড লিখবে না, কোনো প্রশ্ন করবে না।
 
 ১. স্ক্রিপ্টের নিয়ম
 - স্ক্রিপ্ট চূড়ান্ত। একটি শব্দও বদলাবে না, যোগ বা বাদ দেবে না।
@@ -87,8 +87,11 @@ PLAN_SYSTEM = """তুমি "টপিকস বাংলা" মহাকা�
 - টেকনিক্যাল শব্দ ও নাম ইংরেজিতে রাখা যাবে।
 
 ৩. ছবি
+- আগে "domain" ঠিক করবে: স্ক্রিপ্টের বিষয় মহাকাশ/জ্যোতির্বিজ্ঞান হলে "space", অন্য সবকিছুতে "general"।
 - প্রতিটি সিনে image_queries দেবে: ৩টি আলাদা ইংরেজি সার্চ (প্রতিটি ২-৪ শব্দ), সিনের বিষয়ের ছবির জন্য। প্রথমটি সবচেয়ে নির্দিষ্ট, শেষটি সবচেয়ে সাধারণ (যেমন ["Saturn rings Cassini", "Saturn planet", "ringed planet"])।
-- শুধু বাস্তব মহাকাশ ছবির সার্চ দেবে। চার্ট, ডায়াগ্রাম, লোগো নয়।
+- domain "space" হলে শুধু বাস্তব মহাকাশের ছবির সার্চ দেবে।
+- domain "general" হলে সিনের বিষয়ের বাস্তব ছবির সার্চ দেবে (স্থান, বস্তু, প্রাণী, ঐতিহাসিক জিনিস, প্রকৃতি)। কোনো জীবিত বা সাধারণ মানুষের নামে সার্চ দেবে না।
+- চার্ট, ডায়াগ্রাম, লোগো নয়।
 - image_sources তালিকা ফাঁকা রাখবে, সিস্টেম নিজে ভরবে।
 
 ৪. সাউন্ড
@@ -97,6 +100,7 @@ PLAN_SYSTEM = """তুমি "টপিকস বাংলা" মহাকা�
 ৫. আউটপুট: শুধু এই ছকের JSON, বাড়তি লেখা বা মার্কডাউন নয়
 {
   "title": "ছোট শিরোনাম (পোস্টের জন্য)",
+  "domain": "space",
   "scenes": [
     {"sentences": [1,2], "template": "hook", "on_screen_text": "...", "image_queries": ["...", "...", "..."], "sfx": "whoosh"}
   ],
@@ -273,13 +277,14 @@ def wikimedia_search(query, out_path):
     return None
 
 
-def find_image(queries, out_path):
-    """সার্চের তালিকা ধরে NASA, তারপর Wikimedia-তে খোঁজে। না মিললে None।"""
+def find_image(queries, out_path, domain="space"):
+    """সার্চের তালিকা ধরে খোঁজে। মহাকাশ হলে NASA, তারপর Wikimedia; অন্য বিষয়ে শুধু Wikimedia।"""
+    sources = (nasa_search, wikimedia_search) if domain == "space" else (wikimedia_search,)
     for q in queries:
         q = clean_query(q)
         if not q:
             continue
-        for fn in (nasa_search, wikimedia_search):
+        for fn in sources:
             try:
                 info = fn(q, out_path)
             except Exception:
@@ -571,6 +576,8 @@ def handle_video(chat_id, text):
         plan = ask_plan(numbered)
         plan["ratio"] = "16:9" if wide else "9:16"
         plan["sentences"] = sentences
+        if plan.get("domain") not in ("space", "general"):
+            plan["domain"] = "general"
         probs = check_plan(plan, len(sentences))
 
         os.makedirs("video/public", exist_ok=True)
@@ -600,7 +607,7 @@ def handle_video(chat_id, text):
         for i, sc in enumerate(scenes, 1):
             qs = sc.get("image_queries") or []
             fname = f"scene{i}.jpg"
-            info = find_image(qs, f"video/public/{fname}") if qs else None
+            info = find_image(qs, f"video/public/{fname}", plan.get("domain")) if qs else None
             if info and info["id"] in used_ids:
                 info = None
                 try:
@@ -730,14 +737,14 @@ def handle_voice(chat_id, text):
 
 def ask_gemini(topic):
     prompt = (
-        "তুমি 'টপিকস বাংলা' নামের মহাকাশ বিষয়ক ফেসবুক পেজের স্ক্রিপ্টরাইটার।\n"
+        "তুমি 'TOP X BANGLA' নামের ফেসবুক পেজের স্ক্রিপ্টরাইটার। বিষয় মহাকাশ বা অন্য যেকোনো কিছু হতে পারে।\n"
         f"টপিক: {topic}\n\n"
         "নিয়ম:\n"
         "- সহজ ও সুন্দর বাংলায় ৬০-৯০ সেকেন্ডের ভিডিওর ন্যারেশন লেখো (প্রায় ১৫০-২০০ শব্দ)।\n"
         "- প্রথম বাক্যেই দর্শকের কৌতূহল জাগাও।\n"
         "- কোনো মার্কডাউন চিহ্ন (** বা #) ব্যবহার কোরো না, শুধু সাদামাটা লেখা দাও।\n"
         "- শিরোনাম বা সময়সীমার লাইন লিখো না, শুধু ন্যারেশনের লেখা দাও।\n"
-        "- বৈজ্ঞানিক শর্ত বাদ দিয়ে ঢালাও দাবি করো না (যেমন 'যেকোনো নক্ষত্র' না বলে 'অনেক ভারী নক্ষত্র')।\n"
+        "- বৈজ্ঞানিক শর্ত বাদ দিয়ে ঢালাও দাবি করো না (যেমন 'সবসময়' বা 'যেকোনো' না বলে শর্তসহ বলো)।\n"
         "- শুধু নিশ্চিত ও প্রতিষ্ঠিত তথ্য দাও। কোনো সংখ্যা বা দূরত্ব নিয়ে নিশ্চিত না হলে সেটা বাদ দাও।\n"
         "- শেষে আলাদা লাইনে 'যাচাই করার তথ্য:' লিখে স্ক্রিপ্টের সব সংখ্যা ও দাবির তালিকা দাও।"
     )
