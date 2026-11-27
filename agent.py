@@ -555,6 +555,73 @@ def handle_plan(chat_id, text):
         tg_send(chat_id, f"ত্রুটি:\n{str(e)[:600]}")
 
 
+def make_sfx(out_dir):
+    """pop, whoosh, click, chime নামে ছোট সাউন্ড ইফেক্ট কোড দিয়ে বানায় (ফাইল ডাউনলোড লাগে না)।"""
+    import math
+    import random
+    import struct
+
+    os.makedirs(out_dir, exist_ok=True)
+    sr = 44100
+    rnd = random.Random(7)
+
+    def save(name, samples):
+        peak = max(1e-6, max(abs(x) for x in samples))
+        data = b"".join(
+            struct.pack("<h", int(max(-1.0, min(1.0, x / peak * 0.8)) * 32767))
+            for x in samples
+        )
+        with wave.open(f"{out_dir}/{name}.wav", "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(sr)
+            w.writeframes(data)
+
+    # pop: নিচে নামা সুরের ছোট টোকা
+    n = int(sr * 0.14)
+    ph = 0.0
+    out = []
+    for i in range(n):
+        t = i / sr
+        f = 700 * math.exp(-t * 18) + 120
+        ph += 2 * math.pi * f / sr
+        out.append(math.sin(ph) * math.exp(-t * 22))
+    save("pop", out)
+
+    # whoosh: ফিল্টার করা শব্দের ঝাপটা
+    n = int(sr * 0.5)
+    out = []
+    lp = 0.0
+    for i in range(n):
+        t = i / n
+        env = math.sin(math.pi * t) ** 2
+        a = 0.02 + 0.35 * t
+        lp += a * (rnd.uniform(-1, 1) - lp)
+        out.append(lp * env)
+    save("whoosh", out)
+
+    # click: খুব ছোট খটখট
+    n = int(sr * 0.06)
+    out = []
+    for i in range(n):
+        t = i / sr
+        out.append((rnd.uniform(-1, 1) * 0.5 + math.sin(2 * math.pi * 2200 * t)) * math.exp(-t * 90))
+    save("click", out)
+
+    # chime: ঘণ্টার মতো মিষ্টি সুর
+    n = int(sr * 0.9)
+    out = []
+    for i in range(n):
+        t = i / sr
+        v = (
+            math.sin(2 * math.pi * 880 * t)
+            + 0.6 * math.sin(2 * math.pi * 1320 * t)
+            + 0.3 * math.sin(2 * math.pi * 1760 * t)
+        )
+        out.append(v * math.exp(-t * 5) * min(1.0, t * 200))
+    save("chime", out)
+
+
 def handle_video(chat_id, text):
     m = VIDEO_CMD.match(text)
     wide = bool(m.group(1))
@@ -581,6 +648,8 @@ def handle_video(chat_id, text):
         probs = check_plan(plan, len(sentences))
 
         os.makedirs("video/public", exist_ok=True)
+        make_sfx("video/public/sfx")
+        plan["sfx_ready"] = True
         timings, total, models = build_voice(sentences, voice, "video/public/voice.mp3")
 
         scenes = plan["scenes"]
