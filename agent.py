@@ -43,6 +43,11 @@ BAD_TITLE = re.compile(
     re.I,
 )
 UA = {"User-Agent": "TopicsBanglaAgent/1.0 (personal space video project)"}
+PEXELS_KEY = os.environ.get("PEXELS_API_KEY", "").strip()
+CLIP_SECONDS = 2.5        # প্রতি ক্লিপ প্রায় এতক্ষণ দেখানো হবে
+CLIP_TRIM = 4.0           # ফাইলে ক্লিপের কত সেকেন্ড রাখা হবে
+MAX_CLIPS_PER_SCENE = 4
+MAX_CLIPS_TOTAL = 12
 
 # ---------- একাধিক Gemini চাবি: একটায় সীমা (429) শেষ হলে পরেরটা ----------
 _key_i = 0
@@ -511,7 +516,9 @@ def plan_lines(plan):
     out = []
     for i, sc in enumerate(plan["scenes"], 1):
         line = f"{i}. [{sc.get('template')}] বাক্য {sc.get('sentences')} | {sc.get('on_screen_text')}"
-        if sc.get("image_file"):
+        if sc.get("clips"):
+            line += f" | ক্লিপ ×{len(sc['clips'])}"
+        elif sc.get("image_file"):
             line += f" | ছবি ✓ ({sc.get('image_source')})"
         elif "image_file" in sc:
             line += " | ছবি ✗ (মোশন গ্রাফিক্স)"
@@ -622,6 +629,185 @@ def make_sfx(out_dir):
     save("chime", out)
 
 
+def probe_duration(path):
+    try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", path],
+            capture_output=True, text=True, timeout=60,
+        ).stdout.strip()
+        return float(out)
+    except Exception:
+        return 0.0
+
+
+def download_file(url, path, max_mb=60):
+    try:
+        size = 0
+        with requests.get(url, headers=UA, stream=True, timeout=90) as r:
+            if r.status_code != 200:
+                return False
+            with open(path, "wb") as f:
+                for chunk in r.iter_content(1 << 20):
+                    size += len(chunk)
+                    if size > max_mb * 1024 * 1024:
+                        size = 0
+                        break
+                    f.write(chunk)
+        if size < 50000:
+            if os.path.exists(path):
+                os.remove(path)
+            return False
+        return True
+    except Exception:
+        if os.path.exists(path):
+            os.remove(path)
+        return False
+
+
+def make_clip(src, dst, wide):
+    """বড় ভিডিও থেকে ছোট অংশ কেটে ৯:১৬ (বা ১৬:৯) মাপে বসায়, শব্দ ছাড়া। সফল হলে সেকেন্ড ফেরত দেয়।"""
+    w, h = (1920, 1080) if wide else (1080, 1920)
+    dur = probe_duration(src)
+    if dur <= 0.8:
+        return 0.0
+    ss = 0.0
+    if dur > CLIP_TRIM + 1:
+        ss = min(dur * 0.3, dur - CLIP_TRIM - 0.5)
+    vf = f"scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h},fps={FPS},setsar=1"
+    r = subprocess.run(
+        ["ffmpeg", "-y", "-ss", f"{ss:.2f}", "-t", f"{CLIP_TRIM}", "-i", src, "-an", "-vf", vf,
+         "-c:v", "libx264", "-preset", "veryfast", "-crf", "24", "-pix_fmt", "yuv420p",
+         "-movflags", "+faststart", dst],
+        capture_output=True, timeout=180,
+    )
+    if r.returncode != 0 or not os.path.exists(dst) or os.path.getsize(dst) < 20000:
+        return 0.0
+    return probe_duration(dst)
+
+
+def nasa_video_candidates(query, limit=6):
+    r = requests.get(
+        "https://images-api.nasa.gov/search",
+        params={"q": query, "media_type": "video"},
+        headers=UA,
+        timeout=30,
+    )
+    r.raise_for_status()
+    items = r.json().get("collection", {}).get("items", [])
+    out = []
+    for it in items[:15]:
+        data = it["data"][0]
+        nid = data.get("nasa_id")
+        title = data.get("title", "")
+        if not nid or BAD_TITLE.search(title):
+            continue
+        out.append({
+            "source": "NASA",
+            "id": nid,
+            "title": title,
+            "license": "NASA media (ক্রেডিট: NASA)",
+            "credit": f"NASA ({data.get('center', '')})".replace(" ()", ""),
+            "url": f"https://images.nasa.gov/details/{nid}",
+            "_nasa": nid,
+        })
+        if len(out) >= limit:
+            break
+    return out
+
+
+def nasa_video_url(nid):
+    a = requests.get(f"https://images-api.nasa.gov/asset/{nid}", headers=UA, timeout=30)
+    a.raise_for_status()
+    hrefs = [x["href"] for x in a.json()["collection"]["items"]]
+    for key in ("~medium.mp4", "~small.mp4", "~mobile.mp4"):
+        pick = next((h for h in hrefs if h.lower().endswith(key)), None)
+        if pick:
+            return pick.replace("http://", "https://")
+    return None
+
+
+def pexels_video_candidates(query, wide, limit=6):
+    if not PEXELS_KEY:
+        return []
+    r = requests.get(
+        "https://api.pexels.com/videos/search",
+        params={
+            "query": query,
+            "orientation": "landscape" if wide else "portrait",
+            "per_page": 10,
+        },
+        headers={**UA, "Authorization": PEXELS_KEY},
+        timeout=30,
+    )
+    r.raise_for_status()
+    out = []
+    for v in r.json().get("videos", []):
+        files = [f for f in v.get("video_files", []) if f.get("file_type") == "video/mp4" and f.get("link")]
+        if not files:
+            continue
+        best = min(files, key=lambda f: abs(max(f.get("width") or 0, f.get("height") or 0) - 1280))
+        slug = (v.get("url") or "").rstrip("/").split("/")[-1]
+        out.append({
+            "source": "Pexels",
+            "id": f"pexels-{v.get('id')}",
+            "title": slug or "Pexels video",
+            "license": "Pexels License",
+            "credit": (v.get("user") or {}).get("name", "Pexels"),
+            "url": v.get("url", ""),
+            "_link": best["link"],
+        })
+        if len(out) >= limit:
+            break
+    return out
+
+
+def collect_clips(sc, scene_no, n_needed, domain, wide, used_ids, deadline):
+    """সিনের জন্য n_needed টা ছোট ক্লিপ বানায়। যতগুলো পায় ততগুলোই ফেরত দেয়।"""
+    queries = [clean_query(q) for q in (sc.get("image_queries") or []) if clean_query(q)]
+    clips = []
+    for q in queries:
+        if len(clips) >= n_needed or time.time() > deadline:
+            break
+        cands = []
+        for fn in ((lambda: nasa_video_candidates(q)), (lambda: pexels_video_candidates(q, wide))) if domain == "space" \
+                else ((lambda: pexels_video_candidates(q, wide)),):
+            try:
+                cands += fn()
+            except Exception:
+                pass
+        for c in cands:
+            if len(clips) >= n_needed or time.time() > deadline:
+                break
+            if c["id"] in used_ids:
+                continue
+            raw = f"clip_raw_{scene_no}.mp4"
+            dst_rel = f"clips/s{scene_no}_{len(clips) + 1}.mp4"
+            dst = f"video/public/{dst_rel}"
+            try:
+                url = c.get("_link") or nasa_video_url(c["_nasa"])
+                if not url or not download_file(url, raw):
+                    continue
+                dur = make_clip(raw, dst, wide)
+            except Exception:
+                continue
+            finally:
+                if os.path.exists(raw):
+                    os.remove(raw)
+            if dur <= 0:
+                continue
+            used_ids.add(c["id"])
+            clips.append({
+                "file": dst_rel,
+                "dur": round(dur, 2),
+                "source": c["source"],
+                "title": c["title"],
+                "license": c["license"],
+                "credit": c["credit"],
+                "url": c["url"],
+            })
+    return clips
+
+
 def handle_video(chat_id, text):
     m = VIDEO_CMD.match(text)
     wide = bool(m.group(1))
@@ -673,7 +859,29 @@ def handle_video(chat_id, text):
 
         credits = []
         used_ids = set()
+        clip_ids = set()
+        os.makedirs("video/public/clips", exist_ok=True)
+        clip_deadline = time.time() + 240
+        clip_total = 0
         for i, sc in enumerate(scenes, 1):
+            sc["clips"] = []
+            sc["image_file"] = ""
+            want = max(1, min(MAX_CLIPS_PER_SCENE, int(round(sc["duration_sec"] / CLIP_SECONDS))))
+            want = min(want, MAX_CLIPS_TOTAL - clip_total)
+            if want > 0 and time.time() < clip_deadline:
+                try:
+                    got = collect_clips(sc, i, want, plan.get("domain"), wide, clip_ids, clip_deadline)
+                except Exception:
+                    got = []
+                if got:
+                    sc["clips"] = got
+                    clip_total += len(got)
+                    for c in got:
+                        credits.append(
+                            f"সিন {i}: ক্লিপ: {c['title']} | {c['source']} | {c['license']} | {c['credit']}\n{c['url']}"
+                        )
+                    continue
+            # ক্লিপ না পেলে আগের মতো স্থির ছবি
             qs = sc.get("image_queries") or []
             fname = f"scene{i}.jpg"
             info = find_image(qs, f"video/public/{fname}", plan.get("domain")) if qs else None
@@ -694,9 +902,13 @@ def handle_video(chat_id, text):
                 credits.append(
                     f"সিন {i}: {info['title']} | {info['source']} | {info['license']} | {info['credit']}\n{info['url']}"
                 )
-            else:
-                sc["image_file"] = ""
-        plan["image_sources"] = sorted({sc["image_source"] for sc in scenes if sc.get("image_file")})
+        srcs = set()
+        for sc in scenes:
+            if sc.get("clips"):
+                srcs.update(c["source"] for c in sc["clips"])
+            elif sc.get("image_file"):
+                srcs.add(sc["image_source"])
+        plan["image_sources"] = sorted(srcs)
 
         with open("video/public/plan.json", "w", encoding="utf-8") as f:
             json.dump(plan, f, ensure_ascii=False, indent=2)
@@ -720,9 +932,9 @@ def handle_video(chat_id, text):
             out.extend(f"- {p}" for p in probs)
         tg_send(chat_id, "\n".join(out))
         if credits:
-            tg_send(chat_id, "ছবির ক্রেডিট (পোস্টের আগে লিংকে লাইসেন্স একবার দেখে নিন):\n\n" + "\n\n".join(credits))
+            tg_send(chat_id, "ক্লিপ ও ছবির ক্রেডিট (পোস্টের আগে লিংকে লাইসেন্স একবার দেখে নিন):\n\n" + "\n\n".join(credits))
         else:
-            tg_send(chat_id, "কোনো সিনেই উপযুক্ত ছবি পাওয়া যায়নি, সব সিনে মোশন গ্রাফিক্স থাকবে।")
+            tg_send(chat_id, "কোনো সিনেই উপযুক্ত ক্লিপ বা ছবি পাওয়া যায়নি, সব সিনে মোশন গ্রাফিক্স থাকবে।")
         tg_send_doc(chat_id, "plan.json", "plan.json (সময় ও ছবিসহ)")
     except Exception as e:
         tg_send(chat_id, f"ত্রুটি:\n{str(e)[:600]}")
