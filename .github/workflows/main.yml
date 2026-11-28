@@ -41,6 +41,7 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           ALLOWED_CHAT_ID: ${{ secrets.ALLOWED_CHAT_ID }}
+          PEXELS_API_KEY: ${{ secrets.PEXELS_API_KEY }}
       - name: Render video
         if: steps.check.outputs.n != '0' && hashFiles('video_ready.flag') != ''
         working-directory: video
