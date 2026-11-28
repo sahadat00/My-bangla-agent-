@@ -5,6 +5,8 @@ import {
   Composition,
   Easing,
   Img,
+  Loop,
+  OffthreadVideo,
   Sequence,
   interpolate,
   random,
@@ -238,6 +240,67 @@ const KenBurns: React.FC<{ src: string; index: number; total: number }> = ({
           transform: `translate(${tx}px, ${ty}px) scale(${scale}) rotate(${rot}deg)`,
         }}
       />
+      <AbsoluteFill
+        style={{
+          background:
+            "linear-gradient(180deg, rgba(11,16,32,0.6) 0%, rgba(11,16,32,0.38) 45%, rgba(11,16,32,0.8) 100%)",
+        }}
+      />
+    </AbsoluteFill>
+  );
+};
+
+// ===== স্তর ২ (ক্লিপ): রিলসের মতো ২-৩ সেকেন্ডের দ্রুত কাট =====
+type ClipInfo = { file: string; dur: number };
+
+const ClipCut: React.FC<{
+  src: string;
+  clipFrames: number;
+  dur: number;
+  first: boolean;
+}> = ({ src, clipFrames, dur, first }) => {
+  const frame = useCurrentFrame();
+  const p = interpolate(frame, [0, Math.max(1, dur)], [0, 1], {
+    easing: theme.ease.out,
+    ...CL,
+  });
+  const scale = 1.04 + p * 0.08;
+  const flash = first ? 0 : interpolate(frame, [0, 5], [0.3, 0], CL);
+  return (
+    <AbsoluteFill style={{ overflow: "hidden", backgroundColor: theme.colors.bg }}>
+      <AbsoluteFill style={{ transform: `scale(${scale})` }}>
+        <Loop durationInFrames={clipFrames}>
+          <OffthreadVideo
+            src={staticFile(src)}
+            muted
+            style={{ width: "100%", height: "100%", objectFit: "cover" }}
+          />
+        </Loop>
+      </AbsoluteFill>
+      <AbsoluteFill style={{ backgroundColor: "#ffffff", opacity: flash }} />
+    </AbsoluteFill>
+  );
+};
+
+const ClipReel: React.FC<{ clips: ClipInfo[]; total: number; fps: number }> = ({
+  clips,
+  total,
+  fps,
+}) => {
+  const n = clips.length;
+  const seg = Math.max(1, Math.floor(total / n));
+  return (
+    <AbsoluteFill style={{ backgroundColor: theme.colors.bg }}>
+      {clips.map((c, i) => {
+        const from = i * seg;
+        const dur = i === n - 1 ? Math.max(1, total - from) : seg;
+        const clipFrames = Math.max(1, Math.round((c.dur || 3) * fps));
+        return (
+          <Sequence key={i} from={from} durationInFrames={dur}>
+            <ClipCut src={c.file} clipFrames={clipFrames} dur={dur} first={i === 0} />
+          </Sequence>
+        );
+      })}
       <AbsoluteFill
         style={{
           background:
@@ -548,6 +611,7 @@ const SceneView: React.FC<{
   const total: number = sc.duration_frames + lead;
   const ids: number[] = sc.sentences;
   const hasImage = !!sc.image_file;
+  const clips: ClipInfo[] = Array.isArray(sc.clips) ? sc.clips : [];
   const topic = String(sc.on_screen_text || "").trim();
   const opacity =
     lead > 0
@@ -581,7 +645,12 @@ const SceneView: React.FC<{
 
   return (
     <AbsoluteFill style={{ opacity }}>
-      {hasImage ? (
+      {clips.length > 0 ? (
+        <>
+          <BgMesh seed={index + 1} />
+          <ClipReel clips={clips} total={total} fps={fps} />
+        </>
+      ) : hasImage ? (
         <>
           <BgMesh seed={index + 1} />
           <KenBurns src={sc.image_file} index={index} total={total} />
